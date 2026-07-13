@@ -1,201 +1,170 @@
 from pathlib import Path
+import pandas as pd
 import gzip
 import json
 import pickle
 
-import pandas as pd
-
 from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.metrics import (
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-)
-from sklearn.model_selection import GridSearchCV
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.svm import SVC
+from sklearn.svm import SVC, LinearSVC
+
+data_path = Path(__file__).parent.parent / "files" / "input"
 
 
-INPUT_PATH = Path(__file__).parent.parent / "files" / "input"
-OUTPUT_PATH = Path(__file__).parent.parent / "files" / "output"
-MODEL_PATH = Path(__file__).parent.parent / "files" / "models"
-
-def clean_data(df):
-
-    df = df.rename(
+def clean_data(dataframe):
+    """Limpia los datos de default de tarjeta de credito."""
+    dataframe = dataframe.rename(
         columns={"default payment next month": "default"}
     )
-
-    columns_to_drop = [
-        c
-        for c in df.columns
-        if c == "ID" or c.startswith("Unnamed:")
-    ]
-
-    df = df.drop(columns=columns_to_drop)
-
-    df = df.dropna()
-
-    df = df.query("EDUCATION != 0 and MARRIAGE != 0")
-
-    df["EDUCATION"] = df["EDUCATION"].clip(upper=4)
-
-    return df.reset_index(drop=True)
-
-def split_dataset(df):
-
-    x = df.drop(columns="default")
-    y = df["default"]
-
-    return x, y
-
-def build_pipeline(x_train):
-
-    categorical = [
-        "SEX",
-        "EDUCATION",
-        "MARRIAGE",
-    ]
-
-    numeric = x_train.columns.difference(categorical).tolist()
-
-    transformer = ColumnTransformer(
-        [
-            (
-                "categorical",
-                OneHotEncoder(handle_unknown="ignore"),
-                categorical,
-            ),
-            (
-                "numeric",
-                StandardScaler(),
-                numeric,
-            ),
+    dataframe = dataframe.drop(
+        columns=[
+            column
+            for column in dataframe.columns
+            if column == "ID" or column.startswith("Unnamed:")
         ]
     )
+    dataframe = dataframe.dropna()
+    dataframe = dataframe[
+        (dataframe["EDUCATION"] != 0) & (dataframe["MARRIAGE"] != 0)
+    ]
+    dataframe.loc[dataframe["EDUCATION"] > 4, "EDUCATION"] = 4
+    dataframe = dataframe.reset_index(drop=True)
+    return dataframe
 
-    return Pipeline(
-        [
-            ("preprocess", transformer),
-            ("pca", PCA()),
-            ("selector", SelectKBest(score_func=f_classif)),
-            (
-                "classifier",
-                SVC(
-                    kernel="rbf",
-                    random_state=12345,
-                ),
-            ),
-        ]
-    )
+
+train_data = pd.read_csv(data_path / "train_data.csv.zip")
+test_data = pd.read_csv(data_path / "test_data.csv.zip")
+
+train_data = clean_data(train_data)
+test_data = clean_data(test_data)
+
+# Paso 2.
+# Divida los datasets en x_train, y_train, x_test, y_test.
+
+x_train = train_data.copy().drop(columns=["default"])
+y_train = train_data["default"]
+
+x_test = test_data.copy().drop(columns=["default"])
+y_test = test_data["default"]
+
+categorical_features = [
+    "SEX",
+    "EDUCATION",
+    "MARRIAGE",
+]
+
+numeric_features = [
+    column for column in x_train.columns if column not in categorical_features
+]
+
+preprocessor = ColumnTransformer(
+        transformers=[
+            ("onehot", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+            ("scaler", StandardScaler(), numeric_features)
+        ],
+        remainder="passthrough")
+
+pipeline = Pipeline(
+    steps=[
+        ("preprocessor", preprocessor),
+        ("pca", PCA()),
+        ("selector", SelectKBest(score_func=f_classif)),
+        ("classifier", SVC(kernel="rbf",random_state=12345, max_iter=-1)),
+])
+
+from sklearn.metrics import (
+
+        precision_score, 
+        recall_score, 
+        f1_score, 
+        balanced_accuracy_score, 
+        confusion_matrix,
     
-def train_model(pipeline, x_train, y_train):
-
-    parameters = {
-        "pca__n_components": [20, x_train.shape[1] - 2],
-        "selector__k": [12],
-        "classifier__gamma": [0.1],
-    }
-
-    model = GridSearchCV(
-        estimator=pipeline,
-        param_grid=parameters,
-        cv=10,
-        scoring="balanced_accuracy",
-        n_jobs=-1,
-        refit=True,
     )
+from sklearn.model_selection import GridSearchCV
 
-    model.fit(x_train, y_train)
+params_grid =  {
+    "pca__n_components": [20, x_train.shape[1] - 2],
+    "selector__k": [12],
+    "classifier__kernel": ["rbf"],
+    "classifier__gamma": [0.1]
+}
 
-    return model
+model = GridSearchCV(
+    estimator=pipeline,
+    param_grid=params_grid,
+    cv=10,
+    scoring='balanced_accuracy',
+    n_jobs=-1, 
+    refit=True,
+    verbose=1
+)
 
-def save_model(model):
+model.fit(x_train, y_train)
 
-    MODEL_PATH.mkdir(parents=True, exist_ok=True)
+# Paso 5.
+# Guarde el modelo (comprimido con gzip) como "files/models/model.pkl.gz".
+# Recuerde que es posible guardar el modelo comprimido usanzo la libreria gzip.
 
-    with gzip.open(MODEL_PATH / "model.pkl.gz", "wb") as file:
-        pickle.dump(model, file)
-        
-def metrics_dict(name, y_true, y_pred):
+models_path = Path(__file__).parent.parent / "files" / "models"
+models_path.mkdir(parents=True, exist_ok=True)
 
+with gzip.open(models_path / "model.pkl.gz", "wb") as file:
+    pickle.dump(model, file)
+
+
+output_path = Path(__file__).parent.parent / "files" / "output"
+output_path.mkdir(parents=True, exist_ok=True)
+
+y_train_pred = model.predict(x_train)
+y_test_pred = model.predict(x_test)
+
+
+def calculate_metrics(dataset, y_true, y_pred):
     return {
         "type": "metrics",
-        "dataset": name,
-        "precision": float(precision_score(y_true, y_pred)),
-        "balanced_accuracy": float(
-            balanced_accuracy_score(y_true, y_pred)
-        ),
-        "recall": float(recall_score(y_true, y_pred)),
-        "f1_score": float(f1_score(y_true, y_pred)),
+        "dataset": dataset,
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1_score": float(f1_score(y_true, y_pred, zero_division=0)),
     }
 
 
-def confusion_dict(name, y_true, y_pred):
+metrics = [
+    calculate_metrics("train", y_train, y_train_pred),
+    calculate_metrics("test", y_test, y_test_pred),
+]
 
-    tn, fp, fn, tp = confusion_matrix(
-        y_true,
-        y_pred,
-    ).ravel()
+with open(output_path / "metrics.json", "w", encoding="utf-8") as file:
+    for metric in metrics:
+        file.write(json.dumps(metric) + "\n")
 
+
+def calculate_confusion_matrix(dataset, y_true, y_pred):
+    matrix = confusion_matrix(y_true, y_pred)
     return {
         "type": "cm_matrix",
-        "dataset": name,
+        "dataset": dataset,
         "true_0": {
-            "predicted_0": int(tn),
-            "predicted_1": int(fp),
+            "predicted_0": int(matrix[0][0]),
+            "predicted_1": int(matrix[0][1]),
         },
         "true_1": {
-            "predicted_0": int(fn),
-            "predicted_1": int(tp),
+            "predicted_0": int(matrix[1][0]),
+            "predicted_1": int(matrix[1][1]),
         },
     }
 
-def save_results(results):
 
-    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+confusion_matrices = [
+    calculate_confusion_matrix("train", y_train, y_train_pred),
+    calculate_confusion_matrix("test", y_test, y_test_pred),
+]
 
-    with open(
-        OUTPUT_PATH / "metrics.json",
-        "w",
-        encoding="utf-8",
-    ) as file:
-
-        for result in results:
-            file.write(json.dumps(result))
-            file.write("\n")
-
-def pregunta_01():
-
-    train = clean_data(pd.read_csv(INPUT_PATH / "train_data.csv.zip"))
-    test = clean_data(pd.read_csv(INPUT_PATH / "test_data.csv.zip"))
-
-    x_train, y_train = split_dataset(train)
-    x_test, y_test = split_dataset(test)
-
-    pipeline = build_pipeline(x_train)
-
-    model = train_model(
-        pipeline,
-        x_train,
-        y_train,
-    )
-
-    save_model(model)
-
-    train_pred = model.predict(x_train)
-    test_pred = model.predict(x_test)
-
-    results = [
-        metrics_dict("train", y_train, train_pred),
-        metrics_dict("test", y_test, test_pred),
-        confusion_dict("train", y_train, train_pred),
-        confusion_dict("test", y_test, test_pred),
-    ]
-
-    save_results(results)
+with open(output_path / "metrics.json", "a", encoding="utf-8") as file:
+    for matrix in confusion_matrices:
+        file.write(json.dumps(matrix) + "\n")
